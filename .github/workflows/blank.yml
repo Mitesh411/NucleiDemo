@@ -33,8 +33,3 @@ jobs:
         with:
           name: nuclei.log
           path: nuclei.log
-
-      - name: GitHub Security Dashboard Alerts update
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: nuclei.sarif
