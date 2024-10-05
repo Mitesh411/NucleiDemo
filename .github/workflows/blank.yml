@@ -21,15 +21,15 @@ jobs:
   nuclei-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.0
 
       - name: Nuclei - Vulnerability Scan
-        uses: projectdiscovery/nuclei-action@main
+        uses: projectdiscovery/nuclei-action@v2.0.1
         with:
-          target: https://mitesh411.github.io/MyResume/
+          target: http://testphp.vulnweb.com/
 
       - name: GitHub Workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.0
         with:
           name: nuclei.log
           path: nuclei.log
