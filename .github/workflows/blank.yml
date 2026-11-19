@@ -1,35 +1,159 @@
-# This is a basic workflow to help you get started with Actions
+# =============================================================================
+# GitHub Actions workflow: runs owasp-api-top10-swagger-petstore.yaml
+# against the target API with Nuclei, validates the template first, and
+# uploads the full results (plain + JSONL) as a build artifact.
+#
+# SETUP
+#   1. Commit this file at:            .github/workflows/nuclei-owasp-api-top10-scan.yml
+#   2. Commit the template at:         TEMPLATE_PATH below (default: repo root)
+#   3. Trigger manually from the "Actions" tab (workflow_dispatch), or let
+#      the weekly schedule run it.
+#
+# RESPONSIBLE USE — carried over from the template's own header
+#   - This workflow defaults to the public petstore.swagger.io demo and is
+#     intentionally NOT wired to push/pull_request, so it won't fire on
+#     every commit against a shared public service. If you repoint it at
+#     your own API, feel free to add push/pull_request triggers.
+#   - The `race_count` bursts and mutating requests inside the template
+#     itself are already kept low/safe for a shared demo — see the
+#     template's own header before raising them.
+#   - `concurrency` below prevents overlapping runs from stacking load on
+#     the target if someone double-triggers the workflow.
+# =============================================================================
 
-name: CI
+name: Nuclei – OWASP API Top 10 (Swagger Petstore)
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
-     inputs: 
-      comment: 
-        type: string 
-        default: "Nuclei V Scan"
+    inputs:
+      target:
+        description: "Base URL to scan (no trailing slash)"
+        required: false
+        default: "https://petstore.swagger.io"
+      template_path:
+        description: "Path to the Nuclei template in this repo"
+        required: false
+        default: "owasp-api-top10-swagger-petstore.yaml"
+
+  # Runs once a week so the public demo isn't hit on every commit.
+  # Remove or tighten this schedule once the target is your own staging API.
+  schedule:
+    - cron: "0 3 * * 1"   # Monday 03:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nuclei-owasp-api-top10-scan
+  cancel-in-progress: true
+
+env:
+  TARGET: ${{ inputs.target || 'https://petstore.swagger.io' }}
+  TEMPLATE_PATH: ${{ inputs.template_path || 'owasp-api-top10-swagger-petstore.yaml' }}
 
 jobs:
   nuclei-scan:
+    name: Validate + run Nuclei template
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
-      - uses: actions/checkout@v4.2.2
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Nuclei - Vulnerability Scan
-        uses: projectdiscovery/nuclei-action@v3.1.1
+      - name: Set up Go (required to install nuclei)
+        uses: actions/setup-go@v5
         with:
-          target: http://testphp.vulnweb.com/
+          go-version: "1.22"
+          cache: true
 
-      - name: GitHub Workflow artifacts
-        uses: actions/upload-artifact@v4.6.0
+      - name: Install Nuclei
+        run: |
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Print Nuclei version
+        run: nuclei -version
+
+      - name: Confirm template file exists
+        run: |
+          if [ ! -f "${TEMPLATE_PATH}" ]; then
+            echo "::error::Template not found at ${TEMPLATE_PATH}. Check the 'template_path' input or TEMPLATE_PATH default."
+            exit 1
+          fi
+
+      - name: Validate template syntax (no requests sent)
+        run: nuclei -t "${TEMPLATE_PATH}" -validate -duc -silent
+
+      - name: Run Nuclei scan against target
+        id: scan
+        run: |
+          mkdir -p nuclei-results
+          nuclei \
+            -t "${TEMPLATE_PATH}" \
+            -u "${TARGET}" \
+            -duc \
+            -nc \
+            -o nuclei-results/results.txt \
+            -jsonl -j nuclei-results/results.jsonl \
+            -stats \
+            -timeout 15 \
+            -retries 1
+        # -duc        disable the "update templates?" prompt/check
+        # -nc         no colour codes (keeps CI logs readable)
+        # -jsonl/-j   also write machine-readable JSON Lines for the artifact
+        # Exit status: nuclei exits 0 whether or not matches were found, so
+        # this step will not fail the build on its own — see the summary
+        # step below, and the optional fail-on-match step if you want that.
+        continue-on-error: false
+
+      - name: Write run summary
+        if: always()
+        run: |
+          {
+            echo "## Nuclei – OWASP API Top 10 scan summary"
+            echo ""
+            echo "- **Target:** \`${TARGET}\`"
+            echo "- **Template:** \`${TEMPLATE_PATH}\`"
+            echo ""
+            if [ -f nuclei-results/results.jsonl ]; then
+              COUNT=$(wc -l < nuclei-results/results.jsonl | tr -d ' ')
+              echo "- **Matched findings:** ${COUNT}"
+              echo ""
+              if [ "${COUNT}" -gt 0 ]; then
+                echo "Download the \`nuclei-scan-results\` artifact below for the"
+                echo "full JSONL/plain-text output (one line per finding, with"
+                echo "\`template-id\`, \`matcher-name\`, \`host\`, and \`matched-at\`"
+                echo "fields — exact field set depends on the Nuclei version above)."
+              else
+                echo "No matchers fired. Note this template is *expected* to trip"
+                echo "on an intentionally-unhardened public demo like Petstore —"
+                echo "a clean run against your own API is the goal, not the norm."
+              fi
+            else
+              echo "No results file was produced — check the scan step's log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: nuclei.log
-          path: nuclei.log
+          name: nuclei-scan-results
+          path: nuclei-results/
+          retention-days: 14
+          if-no-files-found: warn
+
+      # ---------------------------------------------------------------------
+      # OPTIONAL: fail the build when anything matches. Left disabled by
+      # default because several checks in this template are EXPECTED to
+      # match against a deliberately permissive public demo. Enable this
+      # once you point TARGET at your own API and want CI to break on find.
+      # ---------------------------------------------------------------------
+      # - name: Fail build if any finding matched
+      #   if: always()
+      #   run: |
+      #     if [ -s nuclei-results/results.jsonl ]; then
+      #       echo "::error::Nuclei reported findings — see the nuclei-scan-results artifact."
+      #       exit 1
+      #     fi
