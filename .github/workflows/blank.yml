@@ -21,24 +21,22 @@
 #     the target if someone double-triggers the workflow.
 # =============================================================================
 
-name: Nuclei – OWASP API Top 10 (Swagger Petstore)
+
+name: Nuclei - OWASP API Top 10 (Swagger Petstore)
 
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: "Base URL to scan (no trailing slash)"
+        description: "Authorized API base URL"
         required: false
         default: "https://petstore.swagger.io"
       template_path:
-        description: "Path to the Nuclei template in this repo"
+        description: "Nuclei template path"
         required: false
         default: "owasp-api-top10-swagger-petstore.yaml"
 
-  # Runs once a week so the public demo isn't hit on every commit.
-  # Remove or tighten this schedule once the target is your own staging API.
-  schedule:
-    - cron: "0 3 * * 1"   # Monday 03:00 UTC
+  
 
 permissions:
   contents: read
@@ -53,96 +51,195 @@ env:
 
 jobs:
   nuclei-scan:
-    name: Validate + run Nuclei template
+    name: Validate and run Nuclei scan
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Set up Go (required to install nuclei)
-        uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.22"
+          go-version: '1.25'
           cache: true
 
       - name: Install Nuclei
         run: |
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Print Nuclei version
         run: nuclei -version
 
-      - name: Confirm template file exists
+      - name: Check template exists
         run: |
-          if [ ! -f "${TEMPLATE_PATH}" ]; then
-            echo "::error::Template not found at ${TEMPLATE_PATH}. Check the 'template_path' input or TEMPLATE_PATH default."
+          if [ ! -f "$TEMPLATE_PATH" ]; then
+            echo "::error::Template not found: $TEMPLATE_PATH"
             exit 1
           fi
 
-      - name: Validate template syntax (no requests sent)
-        run: nuclei -t "${TEMPLATE_PATH}" -validate -duc -silent
+      - name: Validate template
+        run: |
+          nuclei -t "$TEMPLATE_PATH" -validate -duc
 
-      - name: Run Nuclei scan against target
-        id: scan
+      - name: Prepare results directory
         run: |
           mkdir -p nuclei-results
+
+      - name: Run Nuclei scan and export reports
+        id: scan
+        run: |
           nuclei \
-            -t "${TEMPLATE_PATH}" \
-            -u "${TARGET}" \
+            -t "$TEMPLATE_PATH" \
+            -u "$TARGET" \
             -duc \
             -nc \
             -o nuclei-results/results.txt \
-            -jsonl -j nuclei-results/results.jsonl \
+            -je nuclei-results/results.json \
+            -jle nuclei-results/results.jsonl \
             -stats \
             -timeout 15 \
             -retries 1
-        # -duc        disable the "update templates?" prompt/check
-        # -nc         no colour codes (keeps CI logs readable)
-        # -jsonl/-j   also write machine-readable JSON Lines for the artifact
-        # Exit status: nuclei exits 0 whether or not matches were found, so
-        # this step will not fail the build on its own — see the summary
-        # step below, and the optional fail-on-match step if you want that.
-        continue-on-error: false
 
-      - name: Write run summary
+      - name: Normalize reports and generate HTML
         if: always()
         run: |
+          mkdir -p nuclei-results
+
+          # Ensure all expected files exist.
+          touch nuclei-results/results.txt
+          touch nuclei-results/results.jsonl
+
+          # An empty JSON export means no findings were exported.
+          if [ ! -s nuclei-results/results.json ]; then
+            echo "[]" > nuclei-results/results.json
+          fi
+
+          # Validate JSON and generate a readable HTML report.
+          python3 <<'PY'
+          import json
+          import html
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          directory = Path("nuclei-results")
+          json_file = directory / "results.json"
+
+          try:
+              data = json.loads(json_file.read_text())
+          except (json.JSONDecodeError, OSError) as exc:
+              raise SystemExit(f"Invalid Nuclei JSON export: {exc}")
+
+          formatted = json.dumps(data, indent=2, ensure_ascii=False)
+          findings = len(data) if isinstance(data, list) else 1
+
+          page = f"""<!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Nuclei API Security Scan Report</title>
+          <style>
+          body {{
+            font-family: Arial, sans-serif;
+            background: #f4f6f9;
+            color: #222;
+            margin: 30px;
+          }}
+          main {{
+            max-width: 1100px;
+            margin: auto;
+            background: white;
+            padding: 25px;
+            border-radius: 10px;
+          }}
+          h1 {{ color: #17365d; }}
+          pre {{
+            background: #17212b;
+            color: #e6edf3;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+          }}
+          .metadata {{
+            background: #edf2f7;
+            padding: 15px;
+            border-radius: 8px;
+          }}
+          </style>
+          </head>
+          <body>
+          <main>
+          <h1>Nuclei API Security Scan Report</h1>
+          <div class="metadata">
+          <p><b>Target:</b> {html.escape(__import__('os').environ.get('TARGET', ''))}</p>
+          <p><b>Template:</b> {html.escape(__import__('os').environ.get('TEMPLATE_PATH', ''))}</p>
+          <p><b>Findings:</b> {findings}</p>
+          <p><b>Generated:</b> {datetime.now(timezone.utc).isoformat()}</p>
+          </div>
+          <h2>Scan Results (JSON)</h2>
+          <pre>{html.escape(formatted)}</pre>
+          </main>
+          </body>
+          </html>"""
+
+          (directory / "report.html").write_text(page, encoding="utf-8")
+
+          # Validate JSONL independently.
+          jsonl_file = directory / "results.jsonl"
+          for number, line in enumerate(
+              jsonl_file.read_text().splitlines(), start=1
+          ):
+              try:
+                  json.loads(line)
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(
+                      f"Invalid JSONL at line {number}: {exc}"
+                  )
+
+          print(f"Validated JSON report: {json_file}")
+          print(f"Findings: {findings}")
+          print("Generated HTML report successfully.")
+          PY
+
+      - name: Write GitHub Actions summary
+        if: always()
+        run: |
+          COUNT=$(wc -l < nuclei-results/results.jsonl | tr -d ' ')
+
           {
-            echo "## Nuclei – OWASP API Top 10 scan summary"
+            echo "## Nuclei API Security Scan"
             echo ""
-            echo "- **Target:** \`${TARGET}\`"
-            echo "- **Template:** \`${TEMPLATE_PATH}\`"
+            echo "- **Target:** $TARGET"
+            echo "- **Template:** $TEMPLATE_PATH"
+            echo "- **Findings:** $COUNT"
             echo ""
-            if [ -f nuclei-results/results.jsonl ]; then
-              COUNT=$(wc -l < nuclei-results/results.jsonl | tr -d ' ')
-              echo "- **Matched findings:** ${COUNT}"
-              echo ""
-              if [ "${COUNT}" -gt 0 ]; then
-                echo "Download the \`nuclei-scan-results\` artifact below for the"
-                echo "full JSONL/plain-text output (one line per finding, with"
-                echo "\`template-id\`, \`matcher-name\`, \`host\`, and \`matched-at\`"
-                echo "fields — exact field set depends on the Nuclei version above)."
-              else
-                echo "No matchers fired. Note this template is *expected* to trip"
-                echo "on an intentionally-unhardened public demo like Petstore —"
-                echo "a clean run against your own API is the goal, not the norm."
-              fi
+            echo "### Generated Reports"
+            echo "- results.txt"
+            echo "- results.json"
+            echo "- results.jsonl"
+            echo "- report.html"
+            echo ""
+            if [ "$COUNT" -gt 0 ]; then
+              echo "Security findings were detected. Review the reports."
             else
-              echo "No results file was produced — check the scan step's log."
+              echo "No findings were exported. This does not guarantee the API is secure."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload results as artifact
+      - name: Upload Nuclei scan reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nuclei-scan-results
           path: nuclei-results/
           retention-days: 14
           if-no-files-found: warn
+
 
       # ---------------------------------------------------------------------
       # OPTIONAL: fail the build when anything matches. Left disabled by
