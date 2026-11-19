@@ -62,11 +62,15 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
+          check-latest: true
           cache: true
 
       - name: Install Nuclei
+        env:
+          GOTOOLCHAIN: auto
         run: |
+          go version
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
@@ -91,6 +95,8 @@ jobs:
       - name: Run Nuclei scan and export reports
         id: scan
         run: |
+         mkdir -p nuclei-results
+        
           nuclei \
             -t "$TEMPLATE_PATH" \
             -u "$TARGET" \
